@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Threading;
 using System.Threading.Tasks;
 using BaGetter.Protocol.Models;
@@ -38,7 +39,20 @@ public class DatabaseSearchService : ISearchService
             request.PackageType,
             frameworks);
 
+        // We need to apply the search query against only the latest version of a package
+        // otherwise we might match older versions that contain out-of-date data.
+        IQueryable<Package> latestPackages = _context.Packages;
+        latestPackages = ApplySearchFilters(
+            latestPackages,
+            request.IncludePrerelease,
+            request.IncludeSemVer2,
+            request.PackageType,
+            frameworks);
+        latestPackages = latestPackages.GroupBy(p => p.Id)
+            .Select(g => g.OrderByDescending(a => a.Key).First());
+
         var packageIds = search
+            .Where(p => latestPackages.Contains(p))
             .Select(p => p.Id)
             .Distinct()
             .OrderBy(id => id)
@@ -152,7 +166,71 @@ public class DatabaseSearchService : ISearchService
 
         search = search.ToLowerInvariant();
 
-        return query.Where(p => p.Id.ToLower().Contains(search));
+        var searchTerms = search.Split(' ');
+        var idSearchTerms = new List<string>();
+
+        foreach (var searchTerm in searchTerms)
+        {
+            var colonIndex = searchTerm.IndexOf(':');
+            if (colonIndex == -1)
+            {
+                idSearchTerms.Add(searchTerm);
+            }
+            else
+            {
+                var property = searchTerm.Substring(0, colonIndex);
+                var term = searchTerm.Substring(colonIndex + 1);
+
+                if (property == "id")
+                {
+                    idSearchTerms.Add(term);
+                }
+                else
+                {
+                    query = ApplySearchTerm(query, property, term);
+                }
+            }
+        }
+
+        if (idSearchTerms.Count != 0)
+        {
+            query = ApplyIdSearchTerms(query, idSearchTerms);
+        }
+
+        return query;
+    }
+
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1862:Use the 'StringComparison' method overloads to perform case-insensitive string comparisons", Justification = "Not for EF queries")]
+    private static IQueryable<Package> ApplySearchTerm(IQueryable<Package> query, string property, string term)
+    {
+        return property switch
+        {
+            "packageid" => query.Where(p => p.Id.ToLower() == term),
+            "version" => query.Where(p => p.NormalizedVersionString.ToLower() == term),
+            "title" => query.Where(p => p.Title.ToLower().Contains(term)),
+            "tags" => query.Where(p => ((string)(object)p.Tags).ToLower().Contains(term)),
+            "author" => query.Where(p => ((string)(object)p.Authors).ToLower().Contains(term)),
+            "description" => query.Where(p => p.Description.ToLower().Contains(term)),
+            "summary" => query.Where(p => p.Summary.ToLower().Contains(term)),
+            _ => query
+        };
+    }
+
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1862:Use the 'StringComparison' method overloads to perform case-insensitive string comparisons", Justification = "Not for EF queries")]
+    private static IQueryable<Package> ApplyIdSearchTerms(IQueryable<Package> query, List<string> idSearchTerms)
+    {
+        var expressions = idSearchTerms.Select(s => (Expression<Func<Package, bool>>)(p => p.Id.ToLower().Contains(s))).ToList();
+
+        if (expressions.Count == 1)
+        {
+            return query.Where(expressions[0]);
+        }
+
+        var orExpression = expressions.Skip(2).Aggregate(
+            Expression.OrElse(expressions[0].Body, Expression.Invoke(expressions[1], expressions[0].Parameters[0])),
+            (x, y) => Expression.OrElse(x, Expression.Invoke(y, expressions[0].Parameters[0])));
+
+        return query.Where(Expression.Lambda<Func<Package, bool>>(orExpression, expressions[0].Parameters));
     }
 
     private static IQueryable<Package> ApplySearchFilters(
